@@ -97,7 +97,6 @@ BelugaSLAMNode::BelugaSLAMNode() : Node("belugaslam_node") {
     this->declare_parameter("recovery_confirmations", 2);
     this->declare_parameter("loop_cache_budget_mb", 64);
 
-
     setup_slam();
 
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
