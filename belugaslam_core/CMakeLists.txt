@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 project(belugaslam_core)
 
+# Most SLAM code is header-only and is compiled again into the ROS executable.
+# An empty build type in either package leaves these hot paths unoptimized.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 find_package(ament_cmake REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(Sophus REQUIRED)
@@ -25,6 +31,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
+target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 
 target_link_libraries(${PROJECT_NAME}
   Sophus::Sophus
@@ -52,7 +59,7 @@ install(
 )
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
-ament_export_dependencies(Eigen3 Sophus)
+ament_export_dependencies(Eigen3 Sophus TBB Ceres)
 ament_export_include_directories(include)
 
 if(BUILD_TESTING)
@@ -60,6 +67,44 @@ if(BUILD_TESTING)
   ament_add_gtest(submap_graph_test test/submap_graph_test.cpp)
   target_include_directories(submap_graph_test PRIVATE include)
   target_link_libraries(submap_graph_test Sophus::Sophus Eigen3::Eigen TBB::tbb)
+  target_compile_features(submap_graph_test PRIVATE cxx_std_17)
+  ament_add_gtest(submap_tracking_test test/submap_tracking_test.cpp)
+  target_include_directories(submap_tracking_test PRIVATE include)
+  target_link_libraries(submap_tracking_test ${PROJECT_NAME})
+  add_executable(motion_filter_test test/motion_filter_test.cpp)
+  target_include_directories(motion_filter_test PRIVATE include)
+  target_compile_features(motion_filter_test PRIVATE cxx_std_17)
+  add_test(NAME motion_filter_test COMMAND motion_filter_test)
+  add_executable(loop_belief_test test/loop_belief_test.cpp)
+  target_include_directories(loop_belief_test PRIVATE include)
+  target_compile_features(loop_belief_test PRIVATE cxx_std_17)
+  add_test(NAME loop_belief_test COMMAND loop_belief_test)
+  add_executable(robust_tracking_test test/robust_tracking_test.cpp)
+  target_include_directories(robust_tracking_test PRIVATE include)
+  target_compile_features(robust_tracking_test PRIVATE cxx_std_17)
+  add_test(NAME robust_tracking_test COMMAND robust_tracking_test)
+  find_package(Threads REQUIRED)
+  add_executable(late_run_test test/late_run_test.cpp)
+  target_include_directories(late_run_test PRIVATE include)
+  target_compile_features(late_run_test PRIVATE cxx_std_17)
+  target_link_libraries(late_run_test Threads::Threads)
+  add_test(NAME late_run_test COMMAND late_run_test)
+  ament_add_gtest(late_run_integration_test test/late_run_integration_test.cpp)
+  target_include_directories(late_run_integration_test PRIVATE include)
+  target_link_libraries(late_run_integration_test ${PROJECT_NAME})
+  ament_add_gtest(quality_integration_test test/quality_integration_test.cpp)
+  target_include_directories(quality_integration_test PRIVATE include)
+  target_link_libraries(quality_integration_test ${PROJECT_NAME})
+  add_executable(grid_update_test test/grid_update_test.cpp)
+  target_include_directories(grid_update_test PRIVATE include)
+  target_compile_features(grid_update_test PRIVATE cxx_std_17)
+  add_test(NAME grid_update_test COMMAND grid_update_test)
+  ament_add_gtest(performance_regression_test test/performance_regression_test.cpp)
+  target_include_directories(performance_regression_test PRIVATE include)
+  target_link_libraries(performance_regression_test ${PROJECT_NAME})
+  ament_add_gtest(loop_pgo_test test/loop_pgo_test.cpp)
+  target_include_directories(loop_pgo_test PRIVATE include)
+  target_link_libraries(loop_pgo_test ${PROJECT_NAME})
 endif()
 
 ament_package()

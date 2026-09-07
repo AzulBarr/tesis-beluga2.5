@@ -16,6 +16,9 @@
 #define BELUGA_MOTION_DIFFERENTIAL_DRIVE_MODEL_HPP
 
 #include <random>
+#include <cmath>
+#include <stdexcept>
+#include <utility>
 #include <sophus/se3.hpp>
 #include <tuple>
 
@@ -97,7 +100,13 @@ class DifferentialDriveModel {
    * \param params Parameters to configure this instance.
    *  See beluga::DifferentialDriveModelParam for details.
    */
-  explicit DifferentialDriveModel(const param_type& params) : params_{params} {}
+  explicit DifferentialDriveModel(const param_type& params) : params_{params} {
+    for (double value : {params.rotation_noise_from_rotation, params.rotation_noise_from_translation,
+                         params.translation_noise_from_translation, params.translation_noise_from_rotation,
+                         params.distance_threshold}) {
+      if (!std::isfinite(value) || value < 0) throw std::invalid_argument("Invalid differential-drive noise/threshold");
+    }
+  }
 
   /// Computes a state sampling function conditioned on a given control action.
   /**
@@ -138,7 +147,7 @@ class DifferentialDriveModel {
         distance > params_.distance_threshold ? heading_rotation * previous_orientation.inverse() : Sophus::SO2d{};
     const auto second_rotation = current_orientation * previous_orientation.inverse() * first_rotation.inverse();
 
-    using DistributionParam = typename std::normal_distribution<double>::param_type;
+    using DistributionParam = std::pair<double, double>;
     const auto first_rotation_params = DistributionParam{
         first_rotation.log(), std::sqrt(
                                   params_.rotation_noise_from_rotation * rotation_variance(first_rotation) +
@@ -154,10 +163,15 @@ class DifferentialDriveModel {
                                    params_.rotation_noise_from_translation * distance_variance)};
 
     return [=](const auto& state, auto& gen) {
-      static thread_local auto distribution = std::normal_distribution<double>{};
-      const auto first_rotation = Sophus::SO2d{distribution(gen, first_rotation_params)};
-      const auto translation = Eigen::Vector2d{distribution(gen, translation_params), 0.0};
-      const auto second_rotation = Sophus::SO2d{distribution(gen, second_rotation_params)};
+      // Zero noise is deterministic. A distribution cache must not leak draws
+      // between independent filters that happen to share the calling thread.
+      const auto draw = [&](const DistributionParam& p) {
+        if (p.second == 0.0) return p.first;
+        return std::normal_distribution<double>{p.first, p.second}(gen);
+      };
+      const auto first_rotation = Sophus::SO2d{draw(first_rotation_params)};
+      const auto translation = Eigen::Vector2d{draw(translation_params), 0.0};
+      const auto second_rotation = Sophus::SO2d{draw(second_rotation_params)};
       return state * Sophus::SE2d{first_rotation, Eigen::Vector2d{0.0, 0.0}} *
              Sophus::SE2d{second_rotation, translation};
     };

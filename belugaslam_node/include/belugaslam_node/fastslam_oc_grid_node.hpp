@@ -58,6 +58,7 @@ private:
     
     /// Extracts and publishes the occupancy grid of the most likely particle.
     void publish_map();
+    void publish_visualization();
 
     /// Extracts and publishes the pose of the most likely particle.
     void publish_best_pose(const rclcpp::Time& stamp);
@@ -83,7 +84,7 @@ private:
      * \param msg The laser scan message.
      * \return A vector of (x, y) coordinates.
      */
-    [[nodiscard]] std::vector<std::pair<double, double>> laser_to_cartesian(const sensor_msgs::msg::LaserScan::SharedPtr msg);
+    [[nodiscard]] std::vector<std::pair<double, double>> laser_to_cartesian(const sensor_msgs::msg::LaserScan::SharedPtr msg, const state_type& start_odom);
     
     /**
      * \brief Converts a geometry_msgs Transform to a Sophus SE2 state.
@@ -135,15 +136,39 @@ private:
     bool publish_trajectory;
     bool save_grid;
     double range_max;
-    double min_update_angle;
-    double min_update_distance;
+    bool deskew_scan_ = true;
     int uncertainty_map_publish_interval;
 
+    rclcpp::TimerBase::SharedPtr visualization_timer_;
+    rclcpp::Time latest_scan_stamp_{0, 0, RCL_ROS_TIME};
+    bool has_processed_scan_ = false;
+    state_type last_output_pose_;
+    std::size_t last_output_hypothesis_ = 0;
+    std::int64_t last_processed_stamp_ns_ = 0;
+    double map_publish_period_ = 1.0;
+    double visualization_publish_period_ = 0.2;
+    std::size_t trajectory_max_poses_ = 5000;
+    std::size_t marker_loop_count_ = 0, marker_split_count_ = 0;
+    std::chrono::steady_clock::time_point last_map_publish_{};
+    double last_map_ms_ = 0.0, last_visualization_ms_ = 0.0;
+    std::uint64_t visualization_ticks_ = 0;
+    std::uint64_t map_publications_ = 0, scans_received_ = 0, scans_processed_ = 0;
+    std::uint64_t tf_errors_ = 0, empty_scans_ = 0, out_of_order_scans_ = 0;
+    std::ofstream performance_csv_;
+    struct ScanTiming {
+        double tf_convert_ms = 0.0, motion_ms = 0.0, matching_ms = 0.0;
+        double insertion_ms = 0.0, backend_ms = 0.0, resample_ms = 0.0, pose_publish_ms = 0.0;
+        double stamp_delta_ms = 0.0, scan_period_ms = 0.0, age_ms = 0.0;
+        std::size_t selected_hypothesis=0, weak_scans=0;
+        bool selection_changed=false;
+        std::string tracking_status="unprocessed";
+        double output_innovation_m=0, output_innovation_rad=0;
+        BelugaSLAM::BackendTiming backend;
+    };
+    void record_performance(const rclcpp::Time& stamp, const char* status,
+                            std::chrono::steady_clock::time_point start, const ScanTiming& timing);
+
     int it = 0; // Iteration counter for controlling the frequency of certain operations (e.g., publishing the uncertainty map).
-
-    double distance = 0;
-
-    double angle_diff = 0;
 
     Sophus::Matrix3<double> covariance_ = 1e3 * Sophus::Matrix3<double>::Identity(); // Covariance matrix for the best particle's pose estimate.
 }; 

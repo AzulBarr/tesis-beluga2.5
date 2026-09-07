@@ -6,14 +6,19 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include <sophus/se2.hpp>
 
 #include "belugaslam_core/particle.hpp"
+#include "belugaslam_core/grid_update.hpp"
+#include "belugaslam_core/robust_tracking.hpp"
+#include "belugaslam_core/derived_cache.hpp"
 
 using SubmapId = std::uint64_t;
 using ScanNodeId = std::uint64_t;
@@ -50,8 +55,8 @@ inline std::vector<std::pair<int, int>> bresenham_line(
  * \brief Inserts one scan into a submap grid with Cartographer's update semantics.
  *
  * The sequence is: grow the grid to fit the whole scan, mark the returns as hits, ray
- * cast the free space as misses, and touch every cell at most once. Nothing is written
- * until the entire scan has been collected, because applying beam by beam is wrong twice
+ * cast the free space as misses, and touch every cell at most once. All hits are written
+ * before ray misses, because applying complete beams one at a time is wrong twice
  * over: a cell crossed by twenty beams would be counted free twenty times, and a cell
  * that is a return for one beam but merely crossed by another would have its hit eroded
  * by that beam's miss. Cartographer avoids both by marking each cell once per insertion
@@ -66,7 +71,8 @@ inline void insert_scan_into_submap_grid(
     LogOddsGrid& grid, const Sophus::SE2d& T_submap_sensor,
     const std::vector<std::pair<double, double>>& scan,
     const ScanInsertionParams& params, std::vector<int>& hit_scratch,
-    std::vector<int>& miss_scratch) {
+    std::vector<int>& miss_scratch,
+    belugaslam::ScanCellUpdates* reusable_updates = nullptr) {
   if (scan.empty()) return;
 
   // 1. Grow first, so that no return is silently clipped and every index below is final.
@@ -102,42 +108,18 @@ inline void insert_scan_into_submap_grid(
     }
   }
 
-  // 2. Collect the whole scan before writing anything.
-  hit_scratch.clear();
-  miss_scratch.clear();
-  const int origin_index = gy0 * grid.width() + gx0;
-
+  // Grow/cell-index conversion stays identical. One reusable epoch marker per
+  // cell replaces sorting all repeated free-space traversals.
+  belugaslam::ScanCellUpdates temporary_updates;
+  auto& updates = reusable_updates ? *reusable_updates : temporary_updates;
+  updates.begin(grid.data().size());
+  updates.endpoints.reserve(scan.size());
   for (const auto& point : scan) {
     const Eigen::Vector2d hit = T_submap_sensor * Eigen::Vector2d{point.first, point.second};
-    const auto [gx1, gy1] = to_cell(hit.x(), hit.y());
-    if (inside(gx1, gy1)) hit_scratch.push_back(gy1 * grid.width() + gx1);
-
-    // The endpoint is excluded by bresenham_line, so this is the free beam interior. A
-    // return that fell outside the grid still clears everything it crossed.
-    for (const auto& cell :
-         bresenham_line(gx0, gy0, gx1, gy1, grid.width(), grid.height())) {
-      const int index = cell.second * grid.width() + cell.first;
-      if (index == origin_index) continue;
-      miss_scratch.push_back(index);
-    }
+    updates.endpoints.push_back(to_cell(hit.x(), hit.y()));
   }
-
-  const auto deduplicate = [](std::vector<int>& cells) {
-    std::sort(cells.begin(), cells.end());
-    cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
-  };
-  deduplicate(hit_scratch);
-  deduplicate(miss_scratch);
-
-  // 3. Hits first, once per cell.
-  for (const int index : hit_scratch) {
-    grid.at(index) = std::min(grid.at(index) + params.l_occ, params.clamp);
-  }
-  // 4. Then misses, once per cell, skipping every cell that was a return.
-  for (const int index : miss_scratch) {
-    if (std::binary_search(hit_scratch.begin(), hit_scratch.end(), index)) continue;
-    grid.at(index) = std::max(grid.at(index) + params.l_free, -params.clamp);
-  }
+  belugaslam::apply_scan_cells(grid.data(), grid.width(), grid.height(), gx0, gy0,
+      params.l_occ, params.l_free, params.clamp, updates, hit_scratch, miss_scratch);
 }
 
 enum class SubmapRole { kAuthoritative, kRedundant, kProvisional };
@@ -158,12 +140,29 @@ public:
 
   LogOddsGrid& mutable_grid() {
     if (is_finished_) throw std::runtime_error("Attempted to mutate a finished submap grid");
+    if (!grid_.unique()) grid_ = std::make_shared<LogOddsGrid>(*grid_);
+    tracking_field_.reset();
     return *grid_;
   }
 
   [[nodiscard]] const LogOddsGrid& grid() const { return *grid_; }
+  // Prepare serially before the parallel read-only matching phase. Invalidated
+  // whenever mutable_grid() is requested or the frozen grid is cropped.
+  [[nodiscard]] std::shared_ptr<const belugaslam::TrackingField> tracking_field() const {
+    if (!tracking_field_) tracking_field_ = std::make_shared<belugaslam::TrackingField>(
+        grid_->data(), grid_->width(), grid_->height(), grid_->resolution(), grid_->origin_x(), grid_->origin_y());
+    return tracking_field_;
+  }
   [[nodiscard]] const Sophus::SE2d& global_pose() const { return global_pose_; }
   void set_global_pose(const Sophus::SE2d& pose) { global_pose_ = pose; }
+  [[nodiscard]] const Sophus::SE2d& local_pose() const { return local_pose_; }
+  void set_local_pose(const Sophus::SE2d& pose) { local_pose_ = pose; }
+  [[nodiscard]] std::uint64_t anchor_sequence() const { return anchor_sequence_; }
+  void set_anchor_sequence(std::uint64_t sequence) { anchor_sequence_ = sequence; }
+  // Trial PGO changes poses only. Grid writes still detach in mutable_grid().
+  [[nodiscard]] std::shared_ptr<Submap> clone_for_pose() const {
+    return std::make_shared<Submap>(*this);
+  }
   [[nodiscard]] SubmapRole role() const { return role_; }
   void set_role(SubmapRole role) { role_ = role; }
   [[nodiscard]] int num_insertions() const { return num_insertions_; }
@@ -179,21 +178,51 @@ public:
   /// structures built, so they are sized to the cropped grid.
   void finish() {
     if (is_finished_) return;
+    if (!grid_.unique()) grid_ = std::make_shared<LogOddsGrid>(*grid_);
     grid_->crop_to_known_cells(kCropMarginCells);
+    tracking_field_.reset();
     is_finished_ = true;
     compute_radial_signature();
-    compute_distance_field();
+    loop_cache_ = std::make_shared<belugaslam::DerivedCache<LoopMatchingData>>();
   }
 
-  /** Distance to the closest occupied cell in local submap coordinates. */
-  [[nodiscard]] float distance_at(double local_x, double local_y) const {
-    if (!distance_field_) return std::numeric_limits<float>::infinity();
-    const int gx = static_cast<int>(std::floor((local_x - grid_->origin_x()) / grid_->resolution()));
-    const int gy = static_cast<int>(std::floor((local_y - grid_->origin_y()) / grid_->resolution()));
-    if (gx < 0 || gx >= grid_->width() || gy < 0 || gy >= grid_->height()) {
-      return std::numeric_limits<float>::infinity();
+  struct LoopMatchingData {
+    std::vector<float> distances;
+    std::vector<double> scores;
+    [[nodiscard]] std::size_t bytes() const {
+      return distances.capacity()*sizeof(float) + scores.capacity()*sizeof(double);
     }
-    return (*distance_field_)[static_cast<std::size_t>(gy * grid_->width() + gx)];
+  };
+  using LoopDataPtr = std::shared_ptr<const LoopMatchingData>;
+  [[nodiscard]] LoopDataPtr loop_matching_data() const {
+    if (!is_finished_ || !loop_cache_) return {};
+    return loop_cache_->acquire([&] { return compute_loop_matching_data(); });
+  }
+  [[nodiscard]] const void* loop_cache_identity() const { return loop_cache_.get(); }
+  [[nodiscard]] std::pair<std::size_t, std::uint64_t> loop_cache_statistics() const {
+    return loop_cache_ ? loop_cache_->statistics() : std::pair<std::size_t,std::uint64_t>{0,0};
+  }
+  void release_loop_cache() const { if (loop_cache_) loop_cache_->release(); }
+  void release_tracking_field() const { tracking_field_.reset(); }
+
+  /** Distance to the closest occupied cell in local submap coordinates. */
+  [[nodiscard]] float distance_at(double x, double y) const {
+    return loop_cell_at(x,y,loop_matching_data()).first;
+  }
+  void prepare_loop_matching() const { (void)loop_matching_data(); }
+  [[nodiscard]] std::pair<float, double> loop_cell_at(double x, double y) const {
+    return loop_cell_at(x,y,loop_matching_data());
+  }
+  // The production matcher acquires one shared payload for the entire search.
+  // No cache locks or shared-pointer churn occur inside its endpoint loop.
+  [[nodiscard]] std::pair<float, double> loop_cell_at(double x, double y, const LoopDataPtr& data) const {
+    if (!data || !std::isfinite(x) || !std::isfinite(y)) return {std::numeric_limits<float>::infinity(), 0.0};
+    const double fx = std::floor((x-grid_->origin_x())/grid_->resolution());
+    const double fy = std::floor((y-grid_->origin_y())/grid_->resolution());
+    if (fx < 0 || fy < 0 || fx >= grid_->width() || fy >= grid_->height())
+      return {std::numeric_limits<float>::infinity(), 0.0};
+    const auto index = static_cast<std::size_t>(fy)*grid_->width()+static_cast<std::size_t>(fx);
+    return {data->distances[index], data->scores[index]};
   }
 
   /** Frozen grid and distance field remain shared; active grids are copied. */
@@ -234,15 +263,16 @@ private:
   }
 
   /** Linear-time chamfer distance transform used by the loop scan matcher. */
-  void compute_distance_field() {
+  [[nodiscard]] LoopMatchingData compute_loop_matching_data() const {
     const int width = grid_->width();
     const int height = grid_->height();
     constexpr float kInfinity = 1.0e6F;
     constexpr float kDiagonal = 1.41421356237F;
-    auto field = std::make_shared<std::vector<float>>(
-        static_cast<std::size_t>(width * height), kInfinity);
+    LoopMatchingData data;
+    auto& field = data.distances;
+    field.assign(static_cast<std::size_t>(width) * height, kInfinity);
     auto at = [width, &field](int x, int y) -> float& {
-      return (*field)[static_cast<std::size_t>(y * width + x)];
+      return field[static_cast<std::size_t>(y * width + x)];
     };
     for (int y = 0; y < height; ++y) {
       for (int x = 0; x < width; ++x) {
@@ -270,18 +300,26 @@ private:
       }
     }
     const float resolution = static_cast<float>(grid_->resolution());
-    for (float& value : *field) value *= resolution;
-    distance_field_ = std::move(field);
+    for (float& value : field) value *= resolution;
+    data.scores.reserve(field.size());
+    for (float distance : field) {
+      const double normalized = static_cast<double>(distance)/0.20;
+      data.scores.push_back(std::exp(-0.5*normalized*normalized));
+    }
+    return data;
   }
 
   SubmapId id_;
   Sophus::SE2d global_pose_;
+  Sophus::SE2d local_pose_ = global_pose_;
+  std::uint64_t anchor_sequence_ = 0;
   std::shared_ptr<LogOddsGrid> grid_;
+  mutable std::shared_ptr<const belugaslam::TrackingField> tracking_field_;
   int num_insertions_;
   bool is_finished_;
   SubmapRole role_;
   std::vector<double> radial_signature_;
-  std::shared_ptr<const std::vector<float>> distance_field_;
+  std::shared_ptr<belugaslam::DerivedCache<LoopMatchingData>> loop_cache_;
 };
 
 /** Immutable keyframe range data shared between graph hypotheses. */
@@ -294,6 +332,14 @@ struct TrajectoryNode {
   ScanNodeId id = 0;
   std::shared_ptr<const ScanNodeData> constant_data;
   Sophus::SE2d global_pose;
+  Sophus::SE2d local_pose;  // immutable frontend pose, never rewritten by PGO
+  std::uint64_t sequence = 0;  // survives point-cloud trimming; shared scan identity
+};
+
+struct TrajectorySample {
+  std::uint64_t sequence = 0;
+  SubmapId submap_id = 0;
+  Sophus::SE2d T_submap_robot;
 };
 
 enum class ConstraintTag { kIntraSubmap, kInterSubmap };
@@ -308,6 +354,8 @@ struct NodeSubmapConstraint {
   ConstraintTag tag = ConstraintTag::kIntraSubmap;
   double score = 1.0;
   double overlap = 1.0;
+  std::uint64_t reference_sequence = 0;
+  std::uint64_t query_sequence = 0;
 };
 
 /** Local trajectory prior between consecutive retained scan nodes. */
@@ -328,12 +376,25 @@ struct SubmapList {
   std::vector<std::shared_ptr<Submap>> history;
   std::vector<std::shared_ptr<Submap>> active_submaps;
   std::vector<TrajectoryNode> trajectory_nodes;
+  std::vector<TrajectorySample> trajectory_samples;
   std::vector<NodeSubmapConstraint> node_submap_constraints;
   std::vector<NodeNodeConstraint> local_trajectory_constraints;
   SubmapId next_submap_id = 0;
   ScanNodeId next_node_id = 0;
   bool has_last_keyframe_pose = false;
   Sophus::SE2d last_keyframe_pose;
+  double last_keyframe_time = 0.0;
+
+  // The oldest active submap is the normal reference. Handover occurs when its
+  // predecessor finishes, so rejected scans cannot pin tracking to a retired map.
+  // Confirmed recovery can explicitly select another mature active reference.
+  bool has_matching_submap = false;
+  SubmapId matching_submap_id = 0;
+
+  [[nodiscard]] std::shared_ptr<const Submap> matching_submap() const {
+    if (has_matching_submap) return find_submap(matching_submap_id);
+    return active_submaps.empty() ? nullptr : active_submaps.front();
+  }
 
   void make_active_unique() {
     for (auto& submap : active_submaps) {
@@ -342,14 +403,39 @@ struct SubmapList {
   }
 
   [[nodiscard]] std::shared_ptr<Submap> find_submap(SubmapId id) const {
-    for (const auto& submap : history) if (submap->id() == id) return submap;
+    // Tracking usually references one of at most two active submaps.
     for (const auto& submap : active_submaps) if (submap->id() == id) return submap;
-    return nullptr;
+    // The count-driven lifecycle appends frozen submaps in increasing ID order.
+    const auto it = std::lower_bound(history.begin(), history.end(), id,
+        [](const auto& submap, SubmapId value) { return submap->id() < value; });
+    return it != history.end() && (*it)->id() == id ? *it : nullptr;
   }
 
   [[nodiscard]] const TrajectoryNode* find_node(ScanNodeId id) const {
     for (const auto& node : trajectory_nodes) if (node.id == id) return &node;
     return nullptr;
+  }
+
+  [[nodiscard]] const TrajectoryNode* find_node_by_sequence(std::uint64_t sequence) const {
+    const auto it = std::lower_bound(trajectory_nodes.begin(), trajectory_nodes.end(), sequence,
+        [](const auto& node, auto value) { return node.sequence < value; });
+    return it != trajectory_nodes.end() && it->sequence == sequence ? &*it : nullptr;
+  }
+
+  [[nodiscard]] const TrajectorySample* find_sample(std::uint64_t sequence) const {
+    const auto it = std::lower_bound(trajectory_samples.begin(), trajectory_samples.end(), sequence,
+        [](const auto& sample, auto value) { return sample.sequence < value; });
+    return it != trajectory_samples.end() && it->sequence == sequence ? &*it : nullptr;
+  }
+
+  [[nodiscard]] bool pose_at_sequence(std::uint64_t sequence, Sophus::SE2d& pose) const {
+    if (const auto* node = find_node_by_sequence(sequence)) { pose = node->global_pose; return true; }
+    const auto* sample = find_sample(sequence);
+    if (!sample) return false;
+    const auto submap = find_submap(sample->submap_id);
+    if (!submap) return false;
+    pose = submap->global_pose() * sample->T_submap_robot;
+    return true;
   }
 
   [[nodiscard]] std::vector<ScanNodeId> insertion_nodes(SubmapId submap_id) const {
@@ -505,6 +591,12 @@ struct Hypothesis {
   std::size_t id = 0;
   SubmapList submaps;
   std::size_t optimized_inter_constraints_count = 0;
+  std::size_t optimized_node_count = 0;
+  std::size_t last_pgo_attempt_node_count = 0;
+  Sophus::SE2d T_global_local;
+  std::uint64_t last_loop_sequence = 0;
+  bool has_loop = false;
+  bool pgo_usable = true;
 
   /** Continuous local-SLAM pose of this hypothesis.
    *
@@ -523,6 +615,20 @@ struct Hypothesis {
    */
   Sophus::SE2d local_pose;
   bool has_local_pose = false;
+  bool tracking_evaluated = false;
+  bool tracking_usable = true;
+  double tracking_overlap = 0.0;
+  std::size_t tracking_failures = 0;
+  std::string tracking_status = "bootstrap";
+  double tracking_log_likelihood = 0.0, tracking_correction = 0.0;
+  bool has_pending_recovery = false;
+  Sophus::SE2d recovery_pose;
+  SubmapId recovery_reference = 0, tracking_reference = 0;
+  std::size_t recovery_confirmations = 0;
+  std::uint64_t recovery_last_sequence = 0;
+  std::uint64_t last_recovery_attempt = std::numeric_limits<std::uint64_t>::max();
+  struct PendingSplit { Sophus::SE2d pose; std::size_t count = 0; std::uint64_t sequence = 0; };
+  std::vector<PendingSplit> pending_splits;
 };
 
 #endif  // __BELUGASLAM_CORE_SUBMAP_HPP__

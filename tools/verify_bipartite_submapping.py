@@ -51,9 +51,17 @@ for legacy in ("odometry_constraints", "loop_constraints", "align_submaps("):
 for parameter in (
     "submap_num_range_data",
     "keyframe_min_translation",
+    "keyframe_min_rotation",
+    "keyframe_max_time",
     "max_points_per_scan_node",
     "loop_max_candidates",
     "max_hypotheses",
+    "enable_loop_closure",
+    "enable_pgo",
+    "loop_verifier_mode",
+    "loop_belief_threshold",
+    "loop_diagnostics_path",
+    "random_seed",
 ):
     assert f'declare_parameter("{parameter}"' in node, f"undeclared ROS parameter: {parameter}"
     assert f'get_parameter("{parameter}")' in node, f"unread ROS parameter: {parameter}"

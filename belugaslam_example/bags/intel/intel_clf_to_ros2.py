@@ -2,19 +2,21 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.clock import Clock as RclClock, ClockType
 
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TransformStamped
 from tf2_msgs.msg import TFMessage
+from rosgraph_msgs.msg import Clock
 
-from math import pi
-# TODO: poner en requerimientos ros2 
+from math import isfinite
 import tf_transformations
 from tf2_ros import StaticTransformBroadcaster
 
 import time
 from pathlib import Path
+from carmen_reader import load_ordered_flaser, scan_angles
 
 
 class IntelDatasetNode(Node):
@@ -29,86 +31,70 @@ class IntelDatasetNode(Node):
         self.static_broadcaster = StaticTransformBroadcaster(self)
 
         script_dir = Path(__file__).resolve().parent
-        self.file = open(script_dir / "intel.clf", "r")
-
+        self.declare_parameter('dataset_path', str(script_dir / 'intel.clf'))
+        self.declare_parameter('replay_rate', 1.0)
+        self.declare_parameter('start_delay', 2.0)
+        self.declare_parameter('publish_clock', True)
+        self.declare_parameter('laser_angle_min_deg', -90.0)
+        self.declare_parameter('laser_angle_increment_deg', 1.0)
+        self.angle_min_deg = float(self.get_parameter('laser_angle_min_deg').value)
+        self.angle_increment_deg = float(self.get_parameter('laser_angle_increment_deg').value)
+        scan_angles(180, self.angle_min_deg, self.angle_increment_deg)  # validate before replay
+        self.replay_rate = float(self.get_parameter('replay_rate').value)
+        delay = float(self.get_parameter('start_delay').value)
+        if not isfinite(self.replay_rate) or self.replay_rate <= 0 or not isfinite(delay) or delay < 0:
+            raise ValueError('replay_rate must be positive and start_delay nonnegative')
+        self.records, backwards = load_ordered_flaser(self.get_parameter('dataset_path').value)
+        self.get_logger().info(
+            f'Loaded {len(self.records)} scans; sorted {backwards} backward timestamp transitions. '
+            f'Replaying at {self.replay_rate:g}x with original acquisition stamps.')
+        self.clock_pub = self.create_publisher(Clock, '/clock', 10) if self.get_parameter('publish_clock').value else None
+        self.next_record = 0
+        self.start_wall = time.monotonic() + delay
+        self.start_stamp_ns = self.records[0].timestamp_ns
         self.static_tf_sent = False
-        self.last_stamp = None
-
-        # timer rápido
-        self.timer = self.create_timer(0.01, self.process_line)
+        # A steady timer avoids deadlock when use_sim_time is enabled. No sleep in
+        # callbacks, no skipped long gaps, and no per-scan accumulated sleep error.
+        self.timer = self.create_timer(0.005, self.process_line, clock=RclClock(clock_type=ClockType.STEADY_TIME))
 
     def process_line(self):
-
-        line = self.file.readline()
-
-        if not line:
-            self.get_logger().info("Fin del dataset")
+        elapsed = time.monotonic() - self.start_wall
+        if elapsed < 0:
+            return
+        replay_ns = min(self.records[-1].timestamp_ns,
+                        self.start_stamp_ns + int(elapsed * self.replay_rate * 1_000_000_000))
+        if self.clock_pub is not None:
+            clock = Clock()
+            clock.clock = rclpy.time.Time(nanoseconds=replay_ns).to_msg()
+            self.clock_pub.publish(clock)
+        if self.next_record == len(self.records):
+            self.get_logger().info(f'Dataset complete: published {self.next_record} scans.')
             self.timer.cancel()
             return
-
-        tokens = line.strip().split()
-
-        if len(tokens) < 2:
+        record = self.records[self.next_record]
+        if record.timestamp_ns > replay_ns:
             return
-
-        if tokens[0] != 'FLASER':
-            return
-
-        num_scans = int(tokens[1])
-
-        if num_scans < 100:
-            return
-
-        # timestamp REAL del dataset
-        laser_timestamp = float(tokens[-1])
-
-        # reproducción temporal real
-        if self.last_stamp is not None:
-
-            dt = laser_timestamp - self.last_stamp
-
-            if dt > 0 and dt < 1.0:
-                time.sleep(dt)
-
-        self.last_stamp = laser_timestamp
-
-        # tiempo ROS
-        t = rclpy.time.Time(
-            seconds=laser_timestamp
-        ).to_msg()
-
-        # -------------------------
-        # LaserScan
-        # -------------------------
-
-        ranges = []
-
-        raw_ranges = tokens[2:2 + num_scans]
-
-        for r in raw_ranges:
-            val = float(r)
-            ranges.append(val)
-
-        # pose
-        x = float(tokens[5 + num_scans])
-        y = float(tokens[6 + num_scans])
-        theta = float(tokens[7 + num_scans])
+        self.next_record += 1
+        t = rclpy.time.Time(nanoseconds=record.timestamp_ns).to_msg()
+        num_scans = len(record.ranges)
+        ranges = list(record.ranges)
+        x, y, theta = record.odometry
 
         scan = LaserScan()
 
         scan.header.stamp = t
         scan.header.frame_id = 'laser_link'
 
-        scan.angle_min = -pi / 2
-        scan.angle_max = pi / 2
-        scan.angle_increment = pi / (num_scans - 1)
+        # Intel's 180 returns use one-degree spacing (-90 through +89).
+        # Do not stretch the array to include an extra, nonexistent +90-degree beam.
+        scan.angle_min, scan.angle_max, scan.angle_increment = scan_angles(
+            num_scans, self.angle_min_deg, self.angle_increment_deg)
 
         scan.range_min = 0.1
         scan.range_max = 81.3
 
         scan.ranges = ranges
 
-        self.scan_pub.publish(scan)
 
         # -------------------------
         # Odometry
@@ -181,6 +167,10 @@ class IntelDatasetNode(Node):
             self.static_broadcaster.sendTransform(static_tf)
 
             self.static_tf_sent = True
+
+        # Publish supporting transforms before the scan that requires them. The
+        # consumer still resolves TF at the scan timestamp; DDS can reorder topics.
+        self.scan_pub.publish(scan)
 
 
 def main():

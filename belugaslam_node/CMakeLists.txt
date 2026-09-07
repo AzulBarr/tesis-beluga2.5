@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.8)
 project(belugaslam_node)
 
+# Most SLAM code is header-only and is compiled again into the ROS executable.
+# An empty build type in either package leaves these hot paths unoptimized.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
