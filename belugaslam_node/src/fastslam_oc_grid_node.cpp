@@ -586,7 +586,6 @@ void BelugaSLAMNode::broadcast_map_to_odom(const rclcpp::Time& stamp, const Soph
     tf_broadcaster_->sendTransform(t);
 }
 
-
 void BelugaSLAMNode::compute_se2_covariance() {
     // Report the selected mode's second moment about the published frontend pose.
     // A covariance about the global mixture mean belongs to a different estimator.
