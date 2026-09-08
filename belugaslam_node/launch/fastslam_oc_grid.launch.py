@@ -127,6 +127,7 @@ def generate_launch_description():
     declare_enable_loop_closure = DeclareLaunchArgument('enable_loop_closure', default_value='true', description='Enable loop candidate verification and branching')
     declare_enable_pgo = DeclareLaunchArgument('enable_pgo', default_value='true', description='Enable periodic PGO; false also prevents loop application')
     declare_loop_verifier_mode = DeclareLaunchArgument('loop_verifier_mode', default_value='belief', description='Loop verifier: belief, map, uniform or geometry')
+    declare_output_selection_mode = DeclareLaunchArgument('output_selection_mode', default_value='map', choices=['map', 'pose_risk'], description='Published pose/map selection; pose_risk minimizes retained frontend squared position loss')
     declare_loop_belief_threshold = DeclareLaunchArgument('loop_belief_threshold', default_value='0.25', description='Minimum aggregated trajectory compatibility')
     declare_loop_translation_scale = DeclareLaunchArgument('loop_translation_scale', default_value='0.30', description='Trajectory alignment translation scale in meters')
     declare_loop_rotation_scale = DeclareLaunchArgument('loop_rotation_scale', default_value='0.10', description='Trajectory alignment rotation scale in radians')
@@ -139,6 +140,8 @@ def generate_launch_description():
     declare_loop_min_points = DeclareLaunchArgument('loop_min_points', default_value='30', description='Minimum points in a loop query scan')
     declare_pgo_every_n_nodes = DeclareLaunchArgument('pgo_every_n_nodes', default_value='20', description='Optimize each live hypothesis after this many inserted nodes')
     declare_pgo_max_iterations = DeclareLaunchArgument('pgo_max_iterations', default_value='50', description='Maximum Ceres iterations per PGO solve')
+    declare_pgo_analytic_jacobians = DeclareLaunchArgument('pgo_analytic_jacobians', default_value='true', description='Use exact analytic SE2 residual derivatives; false restores AutoDiff')
+    declare_loop_robust_polish = DeclareLaunchArgument('loop_robust_polish', default_value='true', description='Check loop trials under the same robust objective used after installation')
     declare_random_seed = DeclareLaunchArgument('random_seed', default_value='42', description='Reproducible core seed; zero requests random seeding')
     declare_loop_diagnostics_path = DeclareLaunchArgument('loop_diagnostics_path', default_value='', description='Optional CSV file for per-hypothesis verification scores')
 
@@ -227,6 +230,7 @@ def generate_launch_description():
             "enable_loop_closure": ParameterValue(LaunchConfiguration('enable_loop_closure'), value_type=bool),
             "enable_pgo": ParameterValue(LaunchConfiguration('enable_pgo'), value_type=bool),
             "loop_verifier_mode": ParameterValue(LaunchConfiguration('loop_verifier_mode'), value_type=str),
+            "output_selection_mode": ParameterValue(LaunchConfiguration('output_selection_mode'), value_type=str),
             "loop_belief_threshold": ParameterValue(LaunchConfiguration('loop_belief_threshold'), value_type=float),
             "loop_translation_scale": ParameterValue(LaunchConfiguration('loop_translation_scale'), value_type=float),
             "loop_rotation_scale": ParameterValue(LaunchConfiguration('loop_rotation_scale'), value_type=float),
@@ -239,6 +243,8 @@ def generate_launch_description():
             "loop_min_points": ParameterValue(LaunchConfiguration('loop_min_points'), value_type=int),
             "pgo_every_n_nodes": ParameterValue(LaunchConfiguration('pgo_every_n_nodes'), value_type=int),
             "pgo_max_iterations": ParameterValue(LaunchConfiguration('pgo_max_iterations'), value_type=int),
+            "pgo_analytic_jacobians": ParameterValue(LaunchConfiguration('pgo_analytic_jacobians'), value_type=bool),
+            "loop_robust_polish": ParameterValue(LaunchConfiguration('loop_robust_polish'), value_type=bool),
             "random_seed": ParameterValue(LaunchConfiguration('random_seed'), value_type=int),
             "loop_diagnostics_path": ParameterValue(LaunchConfiguration('loop_diagnostics_path'), value_type=str),
 
@@ -326,6 +332,7 @@ def generate_launch_description():
     declare_enable_loop_closure,
     declare_enable_pgo,
     declare_loop_verifier_mode,
+    declare_output_selection_mode,
     declare_loop_belief_threshold,
     declare_loop_translation_scale,
     declare_loop_rotation_scale,
@@ -338,6 +345,8 @@ def generate_launch_description():
     declare_loop_min_points,
     declare_pgo_every_n_nodes,
     declare_pgo_max_iterations,
+    declare_pgo_analytic_jacobians,
+    declare_loop_robust_polish,
     declare_random_seed,
     declare_loop_diagnostics_path,
     declare_worker_threads,

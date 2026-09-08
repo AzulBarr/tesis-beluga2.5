@@ -18,6 +18,7 @@
   <arg name="enable_loop_closure" default="true"/>
   <arg name="enable_pgo" default="true"/>
   <arg name="loop_verifier_mode" default="belief"/>
+  <arg name="output_selection_mode" default="map"/>
   <arg name="loop_belief_threshold" default="0.25"/>
   <arg name="loop_translation_scale" default="0.30"/>
   <arg name="loop_rotation_scale" default="0.10"/>
@@ -30,6 +31,8 @@
   <arg name="loop_min_points" default="30"/>
   <arg name="pgo_every_n_nodes" default="20"/>
   <arg name="pgo_max_iterations" default="50"/>
+  <arg name="pgo_analytic_jacobians" default="true"/>
+  <arg name="loop_robust_polish" default="true"/>
   <arg name="random_seed" default="42"/>
   <arg name="loop_diagnostics_path" default=""/>
   <arg name="loop_recent_submaps" default="5"/>
@@ -99,6 +102,7 @@
     <arg name="enable_loop_closure" value="$(var enable_loop_closure)"/>
     <arg name="enable_pgo" value="$(var enable_pgo)"/>
     <arg name="loop_verifier_mode" value="$(var loop_verifier_mode)"/>
+    <arg name="output_selection_mode" value="$(var output_selection_mode)"/>
     <arg name="loop_belief_threshold" value="$(var loop_belief_threshold)"/>
     <arg name="loop_translation_scale" value="$(var loop_translation_scale)"/>
     <arg name="loop_rotation_scale" value="$(var loop_rotation_scale)"/>
@@ -111,6 +115,8 @@
     <arg name="loop_min_points" value="$(var loop_min_points)"/>
     <arg name="pgo_every_n_nodes" value="$(var pgo_every_n_nodes)"/>
     <arg name="pgo_max_iterations" value="$(var pgo_max_iterations)"/>
+    <arg name="pgo_analytic_jacobians" value="$(var pgo_analytic_jacobians)"/>
+    <arg name="loop_robust_polish" value="$(var loop_robust_polish)"/>
     <arg name="random_seed" value="$(var random_seed)"/>
     <arg name="loop_diagnostics_path" value="$(var loop_diagnostics_path)"/>
     <arg name="loop_recent_submaps" value="$(var loop_recent_submaps)"/>

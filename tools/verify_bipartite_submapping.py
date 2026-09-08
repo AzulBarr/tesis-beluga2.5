@@ -58,6 +58,8 @@ for parameter in (
     "max_hypotheses",
     "enable_loop_closure",
     "enable_pgo",
+    "pgo_analytic_jacobians",
+    "loop_robust_polish",
     "loop_verifier_mode",
     "loop_belief_threshold",
     "loop_diagnostics_path",

@@ -59,6 +59,11 @@ def summarize(path, budget_ms=None, expected_stamps=None):
             'stamp_ns','selected_hypothesis','selection_changed','tracking_status','output_innovation_m','output_innovation_rad','backend_ms','trials')} for row in largest]
     loop_rows = [row for row in processed if int(row.get('trials', 0)) > 0]
     report['loop_event_callback_ms'] = percentiles([float(row['total_ms']) for row in loop_rows])
+    if processed and 'polish_solves' in processed[0]:
+        report['robust_polish'] = {
+            'solves': sum(int(row['polish_solves']) for row in processed),
+            'sum_trial_elapsed_ms': sum(float(row['polish_work_ms']) for row in processed),
+            'note': 'Sum of per-trial elapsed times; parallel workers may overlap. Use backend_ms for stage wall time.'}
     seen_maps = {}
     for row in rows:
         count = int(row['map_publications'])

@@ -182,7 +182,14 @@ inline TrackingResult match_tracking_scan(const TrackingField& field,const ScanP
   }
   result.pose=pose;result.final_cost=cost;result.score=tracking_score(field,scan,pose,o);
   result.accepted=std::isfinite(cost) && result.score.inliers>=o.min_points && result.score.overlap>=o.min_overlap;
-  if (!result.accepted) result.pose=prior;
+  if (!result.accepted) {
+    // The caller retains the prediction on rejection. Scores must describe that
+    // returned pose: recovery compares against this likelihood, and diagnostics
+    // report this overlap. The discarded optimizer pose is not the live state.
+    result.pose=prior;
+    result.score=tracking_score(field,scan,prior,o);
+    result.final_cost=result.initial_cost;
+  }
   return result;
 }
 

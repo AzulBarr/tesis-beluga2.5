@@ -43,6 +43,20 @@ int main() {
   auto lost=match_tracking_scan(field,{{100,100},{101,101},{102,102}},{0,0,0},o);
   check(!lost.accepted,"unsupported scan accepted");
   check(lost.pose.x==0&&lost.pose.y==0,"failure must retain odometry prediction");
+  // Force rejection after the optimizer found a different pose. The returned
+  // likelihood/overlap must refer to the retained prediction, not that candidate.
+  auto strict=o;strict.min_points=scan.size()+1;
+  const PoseSample2 rejected_prior{-.15,.10,-.02};
+  const auto rejected=match_tracking_scan(field,scan,rejected_prior,strict);
+  const auto prior_score=tracking_score(field,scan,rejected_prior,strict);
+  check(!rejected.accepted,"strict inlier count must reject");
+  check(rejected.pose.x==rejected_prior.x&&rejected.pose.y==rejected_prior.y&&rejected.pose.yaw==rejected_prior.yaw,
+        "rejected result pose must be prediction");
+  check(std::abs(rejected.score.mean_log_likelihood-prior_score.mean_log_likelihood)<1e-12,
+        "rejected likelihood describes discarded optimizer pose");
+  check(rejected.score.inliers==prior_score.inliers&&rejected.score.overlap==prior_score.overlap,
+        "rejected overlap describes discarded optimizer pose");
+  check(rejected.final_cost==rejected.initial_cost,"rejected cost must describe returned prediction");
   auto sample=field.sample(2.91,1.12);
   const double epsilon=1e-5;
   check(std::abs(sample.dx-(field.sample(2.91+epsilon,1.12).distance-field.sample(2.91-epsilon,1.12).distance)/(2*epsilon))<1e-6,"field x gradient");

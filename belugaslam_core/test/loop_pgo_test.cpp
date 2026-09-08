@@ -10,10 +10,11 @@ void SamePose(const Sophus::SE2d& actual, const Sophus::SE2d& expected) {
   EXPECT_NEAR(error.translation().norm(), 0.0, 1.0e-8);
   EXPECT_NEAR(error.so2().log(), 0.0, 1.0e-8);
 }
-std::unique_ptr<BelugaSLAM> MakeSlam() {
+std::unique_ptr<BelugaSLAM> MakeSlam(bool polish = true) {
   FastSLAMParams params;
   params.min_particles = 1; params.max_particles = 30; params.submap_num_range_data = 2;
   params.keyframe_max_time = 0.0;
+  params.loop_robust_polish = polish;
   return std::make_unique<BelugaSLAM>(
       BelugaSLAM::MotionModel{beluga::DifferentialDriveModelParam{0.1, 0.1, 0.1, 0.1}},
       BelugaSLAM::MeasurementModel{beluga::LikelihoodFieldProbModelParam{100, 2, 0.5, 0.5, 0.2, true}, GridTypeOC{}}, params);
@@ -33,7 +34,101 @@ TEST(LoopPgoTest, DefaultsEnableBeliefVerificationAndPgo) {
   FastSLAMParams params;
   EXPECT_TRUE(params.enable_loop_closure); EXPECT_TRUE(params.enable_pgo);
   EXPECT_EQ(params.loop_verifier_mode, "belief");
+  EXPECT_TRUE(params.loop_robust_polish);
+  EXPECT_TRUE(params.pgo_analytic_jacobians);
   EXPECT_EQ(BELUGASLAM_ENABLE_LOOP_CLOSURE, 1);
+}
+
+TEST(LoopPgoTest, AnalyticCostMatchesAutoDiffIncludingRigidOffsets) {
+  for (int k = 0; k < 32; ++k) {
+    std::array<double, 3> a{0.7*k-9., -0.3*k+8., 0.09*k-1.4};
+    std::array<double, 3> b{-0.4*k+2., 0.5*k-3., -0.08*k+0.2};
+    const double* blocks[] = {a.data(), b.data()};
+    std::array<double, 3> ra{}, rd{};
+    std::array<double, 9> ja{}, jb{}, da{}, db{};
+    double* analytic_j[] = {ja.data(), jb.data()};
+    double* autodiff_j[] = {da.data(), db.data()};
+    std::unique_ptr<ceres::CostFunction> analytic(PoseGraphEdgeError::Create(
+        .3, -.8, .2, 5, 8, .1*k, -.2*k, .07*k, true));
+    std::unique_ptr<ceres::CostFunction> autodiff(PoseGraphEdgeError::Create(
+        .3, -.8, .2, 5, 8, .1*k, -.2*k, .07*k, false));
+    ASSERT_TRUE(analytic->Evaluate(blocks, ra.data(), analytic_j));
+    ASSERT_TRUE(autodiff->Evaluate(blocks, rd.data(), autodiff_j));
+    for (std::size_t i = 0; i < ra.size(); ++i) EXPECT_NEAR(ra[i], rd[i], 1.e-10);
+    for (std::size_t i = 0; i < ja.size(); ++i) {
+      EXPECT_NEAR(ja[i], da[i], 1.e-10);
+      EXPECT_NEAR(jb[i], db[i], 1.e-10);
+    }
+    analytic_j[0] = nullptr;
+    ASSERT_TRUE(analytic->Evaluate(blocks, ra.data(), analytic_j));
+    ASSERT_TRUE(analytic->Evaluate(blocks, ra.data(), nullptr));
+  }
+}
+
+std::shared_ptr<Hypothesis> BuildConflictingPrior(BelugaSLAM& slam, double query_weight) {
+  auto h = std::get<2>(*slam.particles().begin());
+  h->submaps = SubmapList{};
+  auto anchor = std::make_shared<Submap>(0, Pose(), 20, 20, .1);
+  anchor->finish();
+  h->submaps.history.push_back(anchor);
+  for (std::size_t i = 0; i < 3; ++i) {
+    const auto pose = i == 1 ? Pose(0, 1) : Pose();
+    TrajectoryNode node;
+    node.id = i; node.sequence = i; node.local_pose = pose; node.global_pose = pose;
+    h->submaps.trajectory_nodes.push_back(node);
+    h->submaps.trajectory_samples.push_back({i, 0, pose});
+    h->submaps.node_submap_constraints.push_back({0, i, pose, i == 2 ? query_weight : 10., 8.});
+  }
+  h->submaps.next_node_id = 3; h->submaps.next_submap_id = 1;
+  h->has_local_pose = true; h->local_pose = Pose();
+  return h;
+}
+
+TEST(LoopPgoTest, RejectsLoopThatSlipsOutsideFitGateUnderInstalledObjective) {
+  for (bool polish : {false, true}) {
+    auto slam = MakeSlam(polish);
+    const auto h = BuildConflictingPrior(*slam, 10.);
+    ASSERT_TRUE(slam->optimize_pose_graph(h));
+    const auto result = slam->evaluate_loop_candidate(h, {0, 2, h->id, 1., 1., Pose(.5)});
+    EXPECT_NEAR(result.forced_fit_translation, .25, 1.e-3);
+    EXPECT_EQ(result.polish_attempted, polish);
+    EXPECT_EQ(result.usable, !polish);
+    if (polish) {
+      EXPECT_EQ(result.status, "settled_fit_failed");
+      EXPECT_NEAR(result.fit_translation, .4, 1.e-3);
+      EXPECT_DOUBLE_EQ(result.compatibility, 0.);
+      EXPECT_FALSE(result.hypothesis);
+    }
+    EXPECT_EQ(h->submaps.inter_constraint_count(), 0U);
+    SamePose(h->submaps.trajectory_nodes.back().global_pose, Pose());
+  }
+}
+
+TEST(LoopPgoTest, PolishedTrialCannotGainCompatibilityAndRetainsItsFit) {
+  auto slam = MakeSlam();
+  const auto h = BuildConflictingPrior(*slam, std::sqrt(40.));
+  ASSERT_TRUE(slam->optimize_pose_graph(h));
+  const auto result = slam->evaluate_loop_candidate(h, {0, 2, h->id, 1., 1., Pose(.5)});
+  ASSERT_TRUE(result.usable);
+  EXPECT_TRUE(result.polish_attempted);
+  EXPECT_NEAR(result.fit_translation, .25, 1.e-3);
+  EXPECT_LE(result.compatibility, result.forced_compatibility);
+  EXPECT_LE(result.compatibility, result.settled_compatibility);
+  const auto before = result.hypothesis->submaps.trajectory_nodes.back().global_pose;
+  ASSERT_TRUE(slam->optimize_pose_graph(result.hypothesis, false));
+  EXPECT_LT((before.inverse() * result.hypothesis->submaps.trajectory_nodes.back().global_pose).translation().norm(), 1.e-3);
+  EXPECT_EQ(h->submaps.inter_constraint_count(), 0U);
+}
+
+TEST(LoopPgoTest, SkipsSecondSolveInsideHuberQuadraticRegion) {
+  auto slam = MakeSlam();
+  const auto h = BuildConflictingPrior(*slam, 10.);
+  ASSERT_TRUE(slam->optimize_pose_graph(h));
+  const auto result = slam->evaluate_loop_candidate(h, {0, 2, h->id, 1., 1., Pose(.1)});
+  ASSERT_TRUE(result.usable);
+  EXPECT_FALSE(result.polish_attempted);
+  EXPECT_DOUBLE_EQ(result.polish_ms, 0.);
+  EXPECT_NEAR(result.fit_translation, .05, 1.e-3);
 }
 
 TEST(LoopPgoTest, TrialPgoDoesNotMutateLiveMapsParticlesOrConstraints) {

@@ -7,7 +7,7 @@ Unlabelled candidates never count as negatives.
 """
 import argparse
 import csv
-from collections import defaultdict
+from collections import Counter, defaultdict
 import json
 import math
 from pathlib import Path
@@ -31,6 +31,12 @@ def summarize(path, threshold, labels_path=None):
             raise ValueError(f"Labels refer to absent candidate IDs: {sorted(unknown)}")
     result = {"candidates": len(groups), "labelled": len(labels), "hypothesis_rows": 0,
               "belief_accept_map_reject": [], "map_accept_belief_reject": [], "modes": {}}
+    all_rows = [row for rows in groups.values() for row in rows]
+    if all_rows and 'verification_status' in all_rows[0]:
+        result['trial_status_counts'] = dict(Counter(row['verification_status'] for row in all_rows))
+        result['polish_solves'] = sum(int(row['polish_attempted']) for row in all_rows)
+        result['polish_sum_trial_elapsed_ms'] = sum(float(row['polish_ms']) for row in all_rows)
+        result['installed_trials'] = sum(int(row['trial_installed']) for row in all_rows)
     predictions = {mode: {} for mode in ("belief", "map", "uniform", "geometry")}
     for key, rows in groups.items():
         result["hypothesis_rows"] += len(rows)

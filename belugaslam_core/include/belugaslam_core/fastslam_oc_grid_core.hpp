@@ -21,7 +21,9 @@
 #include <tbb/task_arena.h>
 #include "loop_belief.hpp"
 #include "particle_proposal.hpp"
+#include "output_selection.hpp"
 #include <ceres/ceres.h>
+#include "pose_graph_cost.hpp"
 
 #include <range/v3/view/take.hpp>
 #include <range/v3/range/conversion.hpp> 
@@ -67,55 +69,6 @@ using FastSLAMParticle = std::tuple<
     beluga::Weight,
     std::shared_ptr<Hypothesis>
 >;
-
-struct PoseGraphEdgeError {
-    PoseGraphEdgeError(double dx, double dy, double dtheta, double weight_translation = 1.0, double weight_rotation = 1.0,
-                       double offset_x = 0.0, double offset_y = 0.0, double offset_angle = 0.0)
-        : dx_(dx), dy_(dy), dtheta_(dtheta), 
-          weight_translation_(weight_translation), weight_rotation_(weight_rotation),
-          offset_x_(offset_x), offset_y_(offset_y), offset_angle_(offset_angle) {}
-
-    template <typename T>
-    bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
-        // A live submap can be a fixed offset from a shared rigid group variable.
-        T xi = pose_i[0] + ceres::cos(pose_i[2]) * T(offset_x_) - ceres::sin(pose_i[2]) * T(offset_y_);
-        T yi = pose_i[1] + ceres::sin(pose_i[2]) * T(offset_x_) + ceres::cos(pose_i[2]) * T(offset_y_);
-        T theta_i = pose_i[2] + T(offset_angle_);
-
-        T xj = pose_j[0];
-        T yj = pose_j[1];
-        T theta_j = pose_j[2];
-
-        T cos_theta_i = ceres::cos(theta_i);
-        T sin_theta_i = ceres::sin(theta_i);
-
-        // Relative position of j in i's frame
-        T dx_ij = xj - xi;
-        T dy_ij = yj - yi;
-
-        T local_x = cos_theta_i * dx_ij + sin_theta_i * dy_ij;
-        T local_y = -sin_theta_i * dx_ij + cos_theta_i * dy_ij;
-
-        // Residuals scaled by weights
-        residuals[0] = (local_x - T(dx_)) * T(weight_translation_);
-        residuals[1] = (local_y - T(dy_)) * T(weight_translation_);
-        
-        T diff_theta = (theta_j - theta_i) - T(dtheta_);
-        residuals[2] = ceres::atan2(ceres::sin(diff_theta), ceres::cos(diff_theta)) * T(weight_rotation_);
-
-        return true;
-    }
-
-    static ceres::CostFunction* Create(double dx, double dy, double dtheta, double weight_translation = 1.0, double weight_rotation = 1.0,
-                                      double offset_x = 0.0, double offset_y = 0.0, double offset_angle = 0.0) {
-        return new ceres::AutoDiffCostFunction<PoseGraphEdgeError, 3, 3, 3>(
-            new PoseGraphEdgeError(dx, dy, dtheta, weight_translation, weight_rotation, offset_x, offset_y, offset_angle));
-    }
-
-    double dx_, dy_, dtheta_;
-    double weight_translation_, weight_rotation_;
-    double offset_x_, offset_y_, offset_angle_;
-};
 
 // Compile-time override remains available, but loop closure is enabled by default.
 #ifndef BELUGASLAM_ENABLE_LOOP_CLOSURE
@@ -179,6 +132,8 @@ struct FastSLAMParams {
     bool enable_loop_closure = true;
     bool enable_pgo = true;
     std::string loop_verifier_mode = "belief";  // belief, map, uniform, geometry
+    // Output decision only. pose_risk minimizes retained frontend position loss.
+    std::string output_selection_mode = "map";  // map, pose_risk
     double loop_belief_threshold = 0.25;
     double loop_translation_scale = 0.30;  // aligned trajectory RMSE, meters
     double loop_rotation_scale = 0.10;     // aligned trajectory RMSE, radians
@@ -191,6 +146,8 @@ struct FastSLAMParams {
     std::size_t loop_min_points = 30;
     std::size_t pgo_every_n_nodes = 20;
     int pgo_max_iterations = 50;
+    bool pgo_analytic_jacobians = true;
+    bool loop_robust_polish = true;
     std::uint32_t random_seed = 42;
     std::string loop_diagnostics_path;
     int worker_threads = 2;  // bounded total concurrency, including the caller
@@ -249,6 +206,8 @@ public:
                           params.spatial_resolution_theta} {
 
       if (params_.worker_threads < 1) throw std::invalid_argument("worker_threads must be positive");
+      if (params_.output_selection_mode != "map" && params_.output_selection_mode != "pose_risk")
+          throw std::invalid_argument("output_selection_mode must be map or pose_risk");
       for (double x : {params_.tracking.sigma, params_.tracking.prior_translation_sigma,
                        params_.tracking.prior_rotation_sigma, params_.tracking.max_translation,
                        params_.tracking.max_rotation, params_.tracking.inlier_distance,
@@ -325,7 +284,7 @@ public:
           loop_diagnostics_ << "candidate_id,query_sequence,reference_sequence,source_hypothesis,"
               "candidate_dx,candidate_dy,candidate_dtheta,verifier_mode,hypothesis,prior_weight,"
               "trial_usable,fit_translation,fit_rotation,translation_rmse,rotation_rmse,compatibility,"
-              "belief_score,map_score,uniform_score,geometry_score,eligible,selected\n";
+              "belief_score,map_score,uniform_score,geometry_score,eligible,selected,forced_fit_translation,forced_fit_rotation,forced_compatibility,settled_compatibility,polish_attempted,polish_ms,verification_status,trial_installed\n";
       }
 
       // Create the initial hypothesis (single hypothesis: "exploring")
@@ -925,6 +884,8 @@ public:
         double baseline_pgo_ms = 0.0, retrieval_ms = 0.0, verification_ms = 0.0;
         std::size_t baseline_solves = 0, candidates = 0, trials = 0;
         std::size_t local_only_skips = 0, loop_cache_bytes = 0;
+        std::size_t polish_solves = 0;
+        double polish_work_ms = 0.0;  // sum of per-trial elapsed times; workers may overlap
     };
     [[nodiscard]] const BackendTiming& backend_timing() const { return backend_timing_; }
 
@@ -977,50 +938,50 @@ public:
             }
         }
 
-        // --- Determine Best Hypothesis & Best Pose ---
-        std::map<size_t, double> hypothesis_weights;
-        for (const auto& p : particles_) {
-            hypothesis_weights[std::get<2>(p)->id] += static_cast<double>(std::get<1>(p));
-        }
-
-        size_t best_hypothesis_id = hypotheses_.front()->id;
-        double max_hypothesis_weight = -1.0;
-        for (const auto& [hid, hw] : hypothesis_weights) {
-            if (hw > max_hypothesis_weight) {
-                max_hypothesis_weight = hw;
-                best_hypothesis_id = hid;
-            }
-        }
-
-        std::shared_ptr<Hypothesis> best_hypothesis = nullptr;
-        for (auto& h : hypotheses_) {
-            if (h->id == best_hypothesis_id) {
-                best_hypothesis = h;
-                break;
-            }
-        }
-
-        // Publish the pose the map was actually drawn in. Publishing the highest weight
-        // particle instead would make the robot visibly slide against its own map by the
-        // very offsets this local pose exists to remove.
-        double best_particle_weight = -1.0;
-        if (best_hypothesis && best_hypothesis->has_local_pose) {
-            best_pose_ = best_hypothesis->local_pose;
-        } else {
-            for (const auto& p : particles_) {
-                if (std::get<2>(p)->id == best_hypothesis_id) {
-                    double w = static_cast<double>(std::get<1>(p));
-                    if (w > best_particle_weight) {
-                        best_particle_weight = w;
-                        best_pose_ = std::get<0>(p);
-                    }
-                }
-            }
-        }
-
-        best_hypothesis_ = std::move(best_hypothesis);
-        publication_dirty_ = true;
+        refresh_output_selection();
         trim_derived_caches();
+    }
+
+    // Population branching can change a mode's mass without moving any particle.
+    // Keep the selected pose/map tied to the population that will be published.
+    void refresh_output_selection() {
+        struct OutputCandidate {
+            std::shared_ptr<Hypothesis> hypothesis;
+            double mass = 0.0;
+            double best_particle_weight = -1.0;
+            state_type fallback_pose{};
+        };
+        // Stable IDs preserve MAP tie-breaking and deterministic risk ties.
+        std::map<std::size_t, OutputCandidate> candidates;
+        for (const auto& p : particles_) {
+            auto& candidate = candidates[std::get<2>(p)->id];
+            const double weight = static_cast<double>(std::get<1>(p));
+            candidate.hypothesis = std::get<2>(p);
+            candidate.mass += weight;
+            if (weight > candidate.best_particle_weight) {
+                candidate.best_particle_weight = weight;
+                candidate.fallback_pose = std::get<0>(p);
+            }
+        }
+        std::vector<belugaslam::OutputPoseHypothesis> belief;
+        belief.reserve(candidates.size());
+        for (const auto& [id, candidate] : candidates) {
+            const auto& h = candidate.hypothesis;
+            const auto& pose = h->has_local_pose ? h->local_pose : candidate.fallback_pose;
+            belief.push_back({id, candidate.mass, pose.translation().x(), pose.translation().y()});
+        }
+        const auto decision = belugaslam::select_output_pose(belief);
+        const bool use_risk = params_.output_selection_mode == "pose_risk";
+        const auto selected_index = use_risk ? decision.risk_index : decision.map_index;
+        const auto& selected = candidates.at(belief[selected_index].id);
+        map_hypothesis_id_ = belief[decision.map_index].id;
+        map_position_risk_m2_ = decision.map_position_risk;
+        selected_position_risk_m2_ = use_risk ? decision.minimum_position_risk : decision.map_position_risk;
+        // Always publish one complete hypothesis's frontend pose and map together.
+        // No particle, graph, weight, or random-generator state changes here.
+        best_hypothesis_ = selected.hypothesis;
+        best_pose_ = best_hypothesis_->has_local_pose ? best_hypothesis_->local_pose : selected.fallback_pose;
+        publication_dirty_ = true;
     }
 
     void trim_derived_caches() {
@@ -1112,7 +1073,7 @@ public:
         }
         std::stable_sort(branches.begin(), branches.end(), [](const auto& a, const auto& b) { return a.mass > b.mass; });
         if (branches.size() > params_.max_hypotheses) branches.resize(params_.max_hypotheses);
-        if (branches.empty()) return;
+        if (branches.empty()) { refresh_output_selection(); return; }
         double sum = 0.0, squares = 0.0;
         for (const auto& p : particles_) {
             const double w = static_cast<double>(std::get<1>(p));
@@ -1128,10 +1089,15 @@ public:
             }
             if (squares_in_mode > 0 && mass*mass/squares_in_mode < 0.5*count) conditional_depletion = true;
         }
-        if (!conditional_depletion && ess >= particles_.size() / 2.0 && branches.size() == hypotheses_.size()) return;
+        if (!conditional_depletion && ess >= particles_.size() / 2.0 && branches.size() == hypotheses_.size()) {
+            // detect_and_split_modes can change the MAP mode even when ESS is high.
+            refresh_output_selection();
+            return;
+        }
         const auto budget = branches.size() > 1 ? params_.max_particles :
             std::min(params_.max_particles, std::max(params_.min_particles, particles_.size()));
         install_population(branches, std::max(budget, branches.size()));
+        refresh_output_selection();
     }
 
     void detect_and_split_modes(std::vector<double>& weights_view) {
@@ -1330,6 +1296,11 @@ public:
     [[nodiscard]] std::size_t best_hypothesis_id() const {
         return best_hypothesis_ ? best_hypothesis_->id : hypotheses_.front()->id;
     }
+    [[nodiscard]] const std::string& output_selection_mode() const { return params_.output_selection_mode; }
+    [[nodiscard]] std::size_t map_hypothesis_id() const { return map_hypothesis_id_; }
+    // Expected squared position losses under frontend point poses, not ground-truth errors.
+    [[nodiscard]] double map_position_risk_m2() const { return map_position_risk_m2_; }
+    [[nodiscard]] double selected_position_risk_m2() const { return selected_position_risk_m2_; }
     [[nodiscard]] const GridTypeLO& best_log_odds_grid() const {
         refresh_publication(); return best_lo_grid_;
     }
@@ -1446,6 +1417,13 @@ public:
         double fit_translation = std::numeric_limits<double>::infinity();
         double fit_rotation = std::numeric_limits<double>::infinity();
         belugaslam::TrajectoryChange change;
+        double forced_compatibility = 0.0, settled_compatibility = 0.0;
+        double forced_fit_translation = std::numeric_limits<double>::infinity();
+        double forced_fit_rotation = std::numeric_limits<double>::infinity();
+        bool polish_attempted = false;
+        bool installed = false;
+        double polish_ms = 0.0;
+        std::string status = "unavailable";
     };
 
     struct LoopVerification {
@@ -1607,24 +1585,67 @@ public:
         graph.node_submap_constraints.push_back({reference_map->id(), query_id, measurement,
             10.0, 12.0, ConstraintTag::kInterSubmap, candidate.score, candidate.overlap,
             candidate.reference_sequence, candidate.query_sequence});
+        result.status = "forced_solve_failed";
         if (!optimize_pose_graph(trial, false, loop_index)) return result;
-        const auto reference_after = graph.find_submap(reference_map->id());
-        const auto* query_after = graph.find_node(query_id);
-        const auto error = measurement.inverse() * reference_after->global_pose().inverse() * query_after->global_pose;
-        result.fit_translation = error.translation().norm();
-        result.fit_rotation = std::abs(error.so2().log());
-        if (result.fit_translation > params_.loop_max_fit_translation || result.fit_rotation > params_.loop_max_fit_rotation) return result;
-        std::vector<belugaslam::PoseSample2> updated;
-        for (auto sequence : sequences) {
-            state_type pose;
-            if (!graph.pose_at_sequence(sequence, pose)) return result;
-            updated.push_back({pose.translation().x(), pose.translation().y(), pose.so2().log()});
-        }
-        result.change = belugaslam::aligned_trajectory_change(original, updated);
-        result.compatibility = belugaslam::trajectory_compatibility(result.change,
+        const auto fits = [&]() {
+            const auto reference_after = graph.find_submap(reference_map->id());
+            const auto* query_after = graph.find_node(query_id);
+            if (!reference_after || !query_after) return false;
+            const auto error = measurement.inverse() * reference_after->global_pose().inverse() * query_after->global_pose;
+            result.fit_translation = error.translation().norm();
+            result.fit_rotation = std::abs(error.so2().log());
+            return std::isfinite(result.fit_translation) && std::isfinite(result.fit_rotation) &&
+                result.fit_translation <= params_.loop_max_fit_translation && result.fit_rotation <= params_.loop_max_fit_rotation;
+        };
+        const auto change = [&]() -> belugaslam::TrajectoryChange {
+            std::vector<belugaslam::PoseSample2> updated;
+            updated.reserve(sequences.size());
+            for (auto sequence : sequences) {
+                state_type pose;
+                if (!graph.pose_at_sequence(sequence, pose)) return {};
+                updated.push_back({pose.translation().x(), pose.translation().y(), pose.so2().log()});
+            }
+            return belugaslam::aligned_trajectory_change(original, updated);
+        };
+        result.status = "forced_fit_failed";
+        const bool forced_fits = fits();
+        result.forced_fit_translation = result.fit_translation;
+        result.forced_fit_rotation = result.fit_rotation;
+        if (!forced_fits) return result;
+        result.change = change();
+        result.status = "invalid_trajectory";
+        if (!result.change.valid) return result;
+        result.forced_compatibility = belugaslam::trajectory_compatibility(result.change,
             params_.loop_translation_scale, params_.loop_rotation_scale);
-        result.usable = result.change.valid;
-        if (result.usable) result.hypothesis = std::move(trial);
+        result.settled_compatibility = result.forced_compatibility;
+
+        // The trial forces the candidate, but ordinary PGO uses Huber(1) for it.
+        // If its whitened residual lies outside Huber's quadratic region, settle
+        // the trial under the SAME objective used after installation. A candidate
+        // that is then ignored must fail the fit gate, not acquire extra evidence.
+        const auto& edge = graph.node_submap_constraints[loop_index];
+        if (params_.loop_robust_polish && belugaslam::weighted_loop_residual_squared(
+                result.fit_translation, result.fit_rotation, edge.translation_weight, edge.rotation_weight) > 1.0) {
+            result.polish_attempted = true;
+            const auto polish_start = std::chrono::steady_clock::now();
+            const bool settled = optimize_pose_graph(trial, false, std::numeric_limits<std::size_t>::max(), true);
+            result.polish_ms = elapsed_ms(polish_start);
+            result.status = "polish_solve_failed";
+            if (!settled) return result;
+            result.status = "settled_fit_failed";
+            if (!fits()) return result;
+            result.change = change();
+            result.status = "invalid_settled_trajectory";
+            if (!result.change.valid) return result;
+            result.settled_compatibility = belugaslam::trajectory_compatibility(result.change,
+                params_.loop_translation_scale, params_.loop_rotation_scale);
+        }
+        // Same fixed candidate and original trajectory throughout. This guard
+        // cannot raise any mode's compatibility by weakening the candidate loss.
+        result.compatibility = std::min(result.forced_compatibility, result.settled_compatibility);
+        result.usable = true;
+        result.status = result.polish_attempted ? "verified_polished" : "verified";
+        result.hypothesis = std::move(trial);
         return result;
     }
 
@@ -1663,7 +1684,11 @@ public:
         for (auto& report : reports) {
             std::vector<double> compatibilities;
             compatibilities.reserve(prior_hypotheses.size());
-            for (const auto& trial : report.trials) compatibilities.push_back(trial.compatibility);
+            for (const auto& trial : report.trials) {
+                compatibilities.push_back(trial.compatibility);
+                backend_timing_.polish_solves += trial.polish_attempted;
+                backend_timing_.polish_work_ms += trial.polish_ms;
+            }
             report.evidence = belugaslam::marginalize_compatibilities(masses, compatibilities);
             report.decision_score = params_.loop_verifier_mode == "map" ? report.evidence.map :
                 params_.loop_verifier_mode == "uniform" ? report.evidence.uniform :
@@ -1716,7 +1741,13 @@ public:
             if (pool.size() >= 2 && best_null.hypothesis &&
                 std::none_of(pool.begin(), pool.end(), [](const auto& b) { return b.no_loop; })) pool.back() = best_null;
             for (const auto& branch : pool) {
-                if (!branch.no_loop) reports.at(branch.candidate_index).selected = true;
+                if (!branch.no_loop) {
+                    auto& report = reports.at(branch.candidate_index);
+                    report.selected = true;
+                    for (auto& trial : report.trials) {
+                        if (trial.hypothesis == branch.hypothesis) trial.installed = true;
+                    }
+                }
             }
             install_population(pool, params_.max_particles);
             for (auto index : accepted) {
@@ -1741,7 +1772,10 @@ public:
                     << trial.usable << ',' << trial.fit_translation << ',' << trial.fit_rotation << ','
                     << trial.change.translation_rmse << ',' << trial.change.rotation_rmse << ',' << trial.compatibility << ','
                     << report.evidence.weighted << ',' << report.evidence.map << ',' << report.evidence.uniform << ','
-                    << report.candidate.score * report.candidate.overlap << ',' << report.eligible << ',' << report.selected << '\n';
+                    << report.candidate.score * report.candidate.overlap << ',' << report.eligible << ',' << report.selected << ','
+                    << trial.forced_fit_translation << ',' << trial.forced_fit_rotation << ','
+                    << trial.forced_compatibility << ',' << trial.settled_compatibility << ','
+                    << trial.polish_attempted << ',' << trial.polish_ms << ',' << trial.status << ',' << trial.installed << '\n';
             }
         }
         if (loop_diagnostics_.is_open()) loop_diagnostics_.flush();
@@ -1751,7 +1785,8 @@ public:
     // after solver/finite checks. Trial hypotheses never transport live particles.
     bool optimize_pose_graph(const std::shared_ptr<Hypothesis>& hypothesis,
                              bool transport_particles = true,
-                             std::size_t forced_loop_index = std::numeric_limits<std::size_t>::max()) {
+                             std::size_t forced_loop_index = std::numeric_limits<std::size_t>::max(),
+                             bool require_convergence = false) {
         auto& graph = hypothesis->submaps;
         hypothesis->last_pgo_attempt_node_count = graph.trajectory_nodes.size();
         if (graph.trajectory_nodes.empty() || graph.node_submap_constraints.empty()) return false;
@@ -1790,7 +1825,7 @@ public:
             auto* cost = PoseGraphEdgeError::Create(
                 edge.T_submap_node.translation().x(), edge.T_submap_node.translation().y(), edge.T_submap_node.so2().log(),
                 edge.translation_weight, edge.rotation_weight,
-                offset.translation().x(), offset.translation().y(), offset.so2().log());
+                offset.translation().x(), offset.translation().y(), offset.so2().log(), params_.pgo_analytic_jacobians);
             // The candidate being verified MUST exert its full constraint. A robust
             // loss that silently ignores it could otherwise yield a misleadingly
             // unchanged trajectory and make an impossible loop pass verification.
@@ -1802,7 +1837,7 @@ public:
             if (!nodes.count(edge.from_node_id) || !nodes.count(edge.to_node_id)) return false;
             problem.AddResidualBlock(PoseGraphEdgeError::Create(
                 edge.T_from_to.translation().x(), edge.T_from_to.translation().y(), edge.T_from_to.so2().log(),
-                edge.translation_weight, edge.rotation_weight), nullptr,
+                edge.translation_weight, edge.rotation_weight, 0.0, 0.0, 0.0, params_.pgo_analytic_jacobians), nullptr,
                 nodes.at(edge.from_node_id).data(), nodes.at(edge.to_node_id).data());
         }
         auto* gauge = variables.at(variable_id.at(submaps.begin()->first)).data();
@@ -1816,7 +1851,7 @@ public:
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         // A verifier must not interpret an unfinished trial deformation as settled evidence.
-        if (forced_loop_index != std::numeric_limits<std::size_t>::max() &&
+        if ((require_convergence || forced_loop_index != std::numeric_limits<std::size_t>::max()) &&
             summary.termination_type != ceres::CONVERGENCE) return false;
         if (!summary.IsSolutionUsable() || !std::isfinite(summary.initial_cost) || !std::isfinite(summary.final_cost) ||
             summary.final_cost > summary.initial_cost + 1.0e-6 * std::max(1.0, summary.initial_cost)) return false;
@@ -1916,6 +1951,8 @@ private:
 
     /// Derived publication views are refreshed only when a consumer asks for them.
     std::shared_ptr<Hypothesis> best_hypothesis_;
+    std::size_t map_hypothesis_id_ = 0;
+    double map_position_risk_m2_ = 0.0, selected_position_risk_m2_ = 0.0;
     mutable bool publication_dirty_ = true;
     mutable std::size_t publication_rebuilds_ = 0;
     mutable DynamicOccupancyGrid best_oc_grid_;

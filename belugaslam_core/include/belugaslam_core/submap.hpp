@@ -32,24 +32,24 @@ struct ScanInsertionParams {
 };
 
 /** Bresenham line from (x0,y0) toward (x1,y1), excluding the endpoint, clipped to the grid. */
-// inline std::vector<std::pair<int, int>> bresenham_line(
-//     int x0, int y0, int x1, int y1, int max_x, int max_y) {
-//   std::vector<std::pair<int, int>> line;
-//   const int dx = std::abs(x1 - x0);
-//   const int dy = std::abs(y1 - y0);
-//   const int sx = (x0 < x1) ? 1 : -1;
-//   const int sy = (y0 < y1) ? 1 : -1;
-//   int err = dx - dy;
+inline std::vector<std::pair<int, int>> bresenham_line(
+    int x0, int y0, int x1, int y1, int max_x, int max_y) {
+  std::vector<std::pair<int, int>> line;
+  const int dx = std::abs(x1 - x0);
+  const int dy = std::abs(y1 - y0);
+  const int sx = (x0 < x1) ? 1 : -1;
+  const int sy = (y0 < y1) ? 1 : -1;
+  int err = dx - dy;
 
-//   while (true) {
-//     if (x0 == x1 && y0 == y1) break;
-//     if (x0 >= 0 && x0 < max_x && y0 >= 0 && y0 < max_y) line.push_back({x0, y0});
-//     const int e2 = 2 * err;
-//     if (e2 > -dy) { err -= dy; x0 += sx; }
-//     if (e2 < dx) { err += dx; y0 += sy; }
-//   }
-//   return line;
-// }
+  while (true) {
+    if (x0 == x1 && y0 == y1) break;
+    if (x0 >= 0 && x0 < max_x && y0 >= 0 && y0 < max_y) line.push_back({x0, y0});
+    const int e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; x0 += sx; }
+    if (e2 < dx) { err += dx; y0 += sy; }
+  }
+  return line;
+}
 
 /**
  * \brief Inserts one scan into a submap grid with Cartographer's update semantics.
@@ -146,7 +146,6 @@ public:
   }
 
   [[nodiscard]] const LogOddsGrid& grid() const { return *grid_; }
-
   // Prepare serially before the parallel read-only matching phase. Invalidated
   // whenever mutable_grid() is requested or the frozen grid is cropped.
   [[nodiscard]] std::shared_ptr<const belugaslam::TrackingField> tracking_field() const {
@@ -154,7 +153,6 @@ public:
         grid_->data(), grid_->width(), grid_->height(), grid_->resolution(), grid_->origin_x(), grid_->origin_y());
     return tracking_field_;
   }
-
   [[nodiscard]] const Sophus::SE2d& global_pose() const { return global_pose_; }
   void set_global_pose(const Sophus::SE2d& pose) { global_pose_ = pose; }
   [[nodiscard]] const Sophus::SE2d& local_pose() const { return local_pose_; }
@@ -195,7 +193,6 @@ public:
       return distances.capacity()*sizeof(float) + scores.capacity()*sizeof(double);
     }
   };
-  
   using LoopDataPtr = std::shared_ptr<const LoopMatchingData>;
   [[nodiscard]] LoopDataPtr loop_matching_data() const {
     if (!is_finished_ || !loop_cache_) return {};

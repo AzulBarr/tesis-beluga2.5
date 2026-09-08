@@ -71,3 +71,91 @@ TEST(QualityIntegration, RuntimeResolutionIsUsedBySubmapsAndPublishedMap) {
   EXPECT_DOUBLE_EQ(h->submaps.active_submaps.front()->grid().resolution(),.05);
   EXPECT_DOUBLE_EQ(slam->best_occupancy_grid().resolution(),.05);
 }
+
+TEST(QualityIntegration, SpatialSplitRefreshesOutputEvenWithoutEssResampling) {
+  FastSLAMParams p;p.min_particles=30;p.max_particles=30;p.split_persistence=1;
+  auto slam=Slam(p);
+  const auto parent=std::get<2>(*slam->particles().begin());
+  auto other=std::make_shared<Hypothesis>(*parent);other->id=100;
+  parent->has_local_pose=true;parent->local_pose=Pose();
+  other->has_local_pose=true;other->local_pose=Pose(20);
+  slam->install_population({{parent,parent,.55,Pose(),true},{other,parent,.45,Pose(),true}},30);
+  std::size_t count=0;
+  for(const auto& particle:slam->particles())if(std::get<2>(particle)==parent)++count;
+  ASSERT_GE(count,4U);
+  std::size_t index=0;
+  for(auto&& particle:slam->particles()) {
+    if(std::get<2>(particle)==parent)std::get<0>(particle)=Pose(index++<count/2?0:5);
+    else std::get<0>(particle)=Pose(20);
+  }
+  slam->post_update({},{});
+  ASSERT_EQ(slam->best_hypothesis_id(),parent->id);
+  const auto before_count=slam->particles().size();
+  slam->resample();
+  EXPECT_EQ(slam->get_active_hypotheses_count(),3U);
+  EXPECT_EQ(slam->particles().size(),before_count);
+  EXPECT_EQ(slam->best_hypothesis_id(),other->id);
+  EXPECT_NEAR((other->local_pose.inverse()*slam->best_pose()).translation().norm(),0,1e-12);
+  EXPECT_NEAR(slam->hypothesis_masses().at(other->id),.45,1e-12);
+}
+
+TEST(QualityIntegration, PruningRefreshesOutputAfterPopulationInstallation) {
+  FastSLAMParams p;p.min_particles=30;p.max_particles=30;
+  auto slam=Slam(p);const auto parent=std::get<2>(*slam->particles().begin());
+  auto other=std::make_shared<Hypothesis>(*parent);other->id=100;
+  parent->has_local_pose=true;parent->local_pose=Pose();
+  other->has_local_pose=true;other->local_pose=Pose(20);
+  slam->install_population({{parent,parent,.6,Pose(),true},{other,parent,.4,Pose(),true}},30);
+  slam->post_update({},{});ASSERT_EQ(slam->best_hypothesis_id(),parent->id);
+  for(auto&& particle:slam->particles()) {
+    if(std::get<2>(particle)==parent)std::get<1>(particle)=beluga::Weight(0);
+    else std::get<0>(particle)=Pose(20);
+  }
+  slam->resample();
+  EXPECT_EQ(slam->get_active_hypotheses_count(),1U);
+  EXPECT_EQ(slam->best_hypothesis_id(),other->id);
+  EXPECT_NEAR((other->local_pose.inverse()*slam->best_pose()).translation().norm(),0,1e-12);
+  EXPECT_NEAR(slam->hypothesis_masses().at(other->id),1,1e-12);
+}
+
+TEST(QualityIntegration, OutputRiskUsesCombinedPositionMassWithoutChangingInference) {
+  for (const std::string mode : {"map", "pose_risk"}) {
+    FastSLAMParams p;p.min_particles=30;p.max_particles=30;p.output_selection_mode=mode;
+    auto slam=Slam(p);const auto parent=std::get<2>(*slam->particles().begin());
+    auto a=std::make_shared<Hypothesis>(*parent);a->id=100;
+    auto b=std::make_shared<Hypothesis>(*parent);b->id=101;
+    parent->has_local_pose=a->has_local_pose=b->has_local_pose=true;
+    parent->local_pose=Pose();a->local_pose=Pose(1,0,.2);b->local_pose=Pose(1,0,.3);
+    slam->install_population({{parent,parent,.4,Pose(),true},{a,parent,.3,Pose(),true},
+                             {b,parent,.3,Pose(),true}},30);
+    const auto masses=slam->hypothesis_masses();
+    std::vector<state_type> poses;
+    std::vector<double> weights;
+    std::vector<std::shared_ptr<Hypothesis>> owners;
+    for(const auto& particle:slam->particles()) {
+      poses.push_back(std::get<0>(particle));
+      weights.push_back(static_cast<double>(std::get<1>(particle)));
+      owners.push_back(std::get<2>(particle));
+    }
+    slam->refresh_output_selection();
+    EXPECT_EQ(slam->map_hypothesis_id(),parent->id);
+    EXPECT_EQ(slam->best_hypothesis_id(),mode=="map"?parent->id:a->id);
+    EXPECT_NEAR(slam->best_pose().translation().x(),mode=="map"?0:1,1e-12);
+    EXPECT_NEAR(slam->best_pose().so2().log(),mode=="map"?0:.2,1e-12);
+    EXPECT_NEAR(slam->map_position_risk_m2(),.6,1e-12);
+    EXPECT_NEAR(slam->selected_position_risk_m2(),mode=="map"?.6:.4,1e-12);
+    EXPECT_EQ(slam->hypothesis_masses(),masses);
+    std::size_t i=0;
+    for(const auto& particle:slam->particles()) {
+      EXPECT_NEAR((poses[i].inverse()*std::get<0>(particle)).translation().norm(),0,1e-12);
+      EXPECT_NEAR((poses[i].inverse()*std::get<0>(particle)).so2().log(),0,1e-12);
+      EXPECT_DOUBLE_EQ(static_cast<double>(std::get<1>(particle)),weights[i]);
+      EXPECT_EQ(std::get<2>(particle),owners[i]);++i;
+    }
+  }
+}
+
+TEST(QualityIntegration, InvalidOutputModeIsRejected) {
+  FastSLAMParams p;p.output_selection_mode="unknown";
+  EXPECT_THROW(Slam(p),std::invalid_argument);
+}

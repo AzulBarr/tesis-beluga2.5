@@ -1,4 +1,5 @@
 #include "belugaslam_node/fastslam_oc_grid_node.hpp"
+#include <string_view>
 using namespace rclcpp;
 
 BelugaSLAMNode::BelugaSLAMNode() : Node("belugaslam_node") {
@@ -42,6 +43,7 @@ BelugaSLAMNode::BelugaSLAMNode() : Node("belugaslam_node") {
     this->declare_parameter("enable_loop_closure", true);
     this->declare_parameter("enable_pgo", true);
     this->declare_parameter("loop_verifier_mode", "belief");
+    this->declare_parameter("output_selection_mode", "map");
     this->declare_parameter("loop_belief_threshold", 0.25);
     this->declare_parameter("loop_translation_scale", 0.30);
     this->declare_parameter("loop_rotation_scale", 0.10);
@@ -54,6 +56,8 @@ BelugaSLAMNode::BelugaSLAMNode() : Node("belugaslam_node") {
     this->declare_parameter("loop_min_points", 30);
     this->declare_parameter("pgo_every_n_nodes", 20);
     this->declare_parameter("pgo_max_iterations", 50);
+    this->declare_parameter("pgo_analytic_jacobians", true);
+    this->declare_parameter("loop_robust_polish", true);
     this->declare_parameter("random_seed", 42);
     this->declare_parameter("loop_diagnostics_path", "");
 
@@ -96,6 +100,7 @@ BelugaSLAMNode::BelugaSLAMNode() : Node("belugaslam_node") {
     this->declare_parameter("recovery_interval", 3);
     this->declare_parameter("recovery_confirmations", 2);
     this->declare_parameter("loop_cache_budget_mb", 64);
+
 
     setup_slam();
 
@@ -187,6 +192,7 @@ void BelugaSLAMNode::setup_slam() {
     params.enable_loop_closure = get_parameter("enable_loop_closure").as_bool();
     params.enable_pgo = get_parameter("enable_pgo").as_bool();
     params.loop_verifier_mode = get_parameter("loop_verifier_mode").as_string();
+    params.output_selection_mode = get_parameter("output_selection_mode").as_string();
     params.loop_belief_threshold = get_parameter("loop_belief_threshold").as_double();
     params.loop_translation_scale = get_parameter("loop_translation_scale").as_double();
     params.loop_rotation_scale = get_parameter("loop_rotation_scale").as_double();
@@ -203,6 +209,8 @@ void BelugaSLAMNode::setup_slam() {
     if (get_parameter("pgo_every_n_nodes").as_int() < 0) throw std::invalid_argument("pgo_every_n_nodes must be nonnegative");
     params.pgo_every_n_nodes = static_cast<decltype(params.pgo_every_n_nodes)>(get_parameter("pgo_every_n_nodes").as_int());
     params.pgo_max_iterations = get_parameter("pgo_max_iterations").as_int();
+    params.pgo_analytic_jacobians = get_parameter("pgo_analytic_jacobians").as_bool();
+    params.loop_robust_polish = get_parameter("loop_robust_polish").as_bool();
     if (get_parameter("random_seed").as_int() < 0) throw std::invalid_argument("random_seed must be nonnegative");
     params.random_seed = static_cast<decltype(params.random_seed)>(get_parameter("random_seed").as_int());
     params.loop_diagnostics_path = get_parameter("loop_diagnostics_path").as_string();
@@ -232,7 +240,7 @@ void BelugaSLAMNode::setup_slam() {
                "motion_ms,matching_ms,insertion_ms,backend_ms,resample_ms,pose_publish_ms,"
                "baseline_pgo_ms,retrieval_ms,verification_ms,baseline_solves,candidates,trials,"
                "particles,hypotheses,processed,tf_errors,empty_scans,out_of_order_scans,"
-               "map_publications,last_map_ms,visualization_ticks,last_visualization_ms,local_only_pgo_skips,loop_cache_bytes,selected_hypothesis,selection_changed,tracking_status,weak_scans,output_innovation_m,output_innovation_rad\n";
+               "map_publications,last_map_ms,visualization_ticks,last_visualization_ms,local_only_pgo_skips,loop_cache_bytes,selected_hypothesis,selection_changed,tracking_status,weak_scans,output_innovation_m,output_innovation_rad,output_x,output_y,output_yaw,output_selection_mode,map_hypothesis,map_position_risk_m2,selected_position_risk_m2,polish_solves,polish_work_ms\n";
     }
 
     params.tracking.sigma = static_cast<decltype(params.tracking.sigma)>(get_parameter("tracking_sigma").as_double());
@@ -372,7 +380,19 @@ void BelugaSLAMNode::record_performance(const rclcpp::Time& stamp, const char* s
             << map_publications_ << ',' << last_map_ms_ << ',' << visualization_ticks_ << ',' << last_visualization_ms_ << ','
             << t.backend.local_only_skips << ',' << t.backend.loop_cache_bytes << ',' << t.selected_hypothesis << ','
             << t.selection_changed << ',' << t.tracking_status << ',' << t.weak_scans << ','
-            << t.output_innovation_m << ',' << t.output_innovation_rad << '\n';
+            << t.output_innovation_m << ',' << t.output_innovation_rad;
+        // Export the exact online pose used for /best_pose at this scan stamp.
+        // Rejected callbacks have no new estimate; leave all three fields empty.
+        if (std::string_view(status) == "processed") {
+            performance_csv_ << ',' << last_output_pose_.translation().x() << ','
+                << last_output_pose_.translation().y() << ',' << last_output_pose_.so2().log() << ','
+                << slam_->output_selection_mode() << ',' << slam_->map_hypothesis_id() << ','
+                << slam_->map_position_risk_m2() << ',' << slam_->selected_position_risk_m2() << ','
+                << t.backend.polish_solves << ',' << t.backend.polish_work_ms;
+        } else {
+            performance_csv_ << ",,,,,,,,,";
+        }
+        performance_csv_ << '\n';
         if (scans_received_ % 100 == 0) performance_csv_.flush();
     }
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -585,6 +605,7 @@ void BelugaSLAMNode::broadcast_map_to_odom(const rclcpp::Time& stamp, const Soph
     t.transform.rotation = tf2::toMsg(q);
     tf_broadcaster_->sendTransform(t);
 }
+
 
 void BelugaSLAMNode::compute_se2_covariance() {
     // Report the selected mode's second moment about the published frontend pose.
